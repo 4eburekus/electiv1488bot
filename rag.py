@@ -1,6 +1,7 @@
 import math
 import os
 import pickle
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -12,8 +13,14 @@ BASE_DIR = Path(__file__).resolve().parent
 KB_PATH = BASE_DIR / "knowledge_base.txt"
 CACHE_PATH = BASE_DIR / ".rag_index.pkl"
 
-OPENROUTER_BASE = "https://routerai.ru/api/v1"
-EMBED_MODEL = "baai/bge-m3"
+# Локальный сервер эмбеддингов (bionic / llama.cpp, OpenAI-совместимый API).
+# Переопределяется в .env: EMBED_BASE_URL / EMBED_MODEL / EMBED_API_KEY
+EMBED_BASE = os.getenv("EMBED_BASE_URL", "http://localhost:1235/v1")
+# id модели берём ровно тот, что отдаёт GET {EMBED_BASE}/models
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-bge-m3")
+# Локальному серверу ключ не нужен, но openai-клиент требует непустую строку.
+EMBED_API_KEY = os.getenv("EMBED_API_KEY") or "local"
+
 
 MAX_CHUNK_CHARS = 1200
 MIN_CHUNK_CHARS = 200
@@ -24,14 +31,14 @@ _index = None
 
 
 def _embeddings_client() -> OpenAIEmbeddings:
-    api_key = os.getenv("ROUTERAIRU_API_KEY")
-    if not api_key:
-        raise RuntimeError("Не задан ROUTERAIRU_API_KEY")
     return OpenAIEmbeddings(
         model=EMBED_MODEL,
-        openai_api_key=api_key,
-        openai_api_base=OPENROUTER_BASE,
+        openai_api_key=EMBED_API_KEY,
+        openai_api_base=EMBED_BASE,
+        # локальные серверы не считают токены через tiktoken — отключаем,
+        # иначе падает на подсчёте длины перед запросом
         check_embedding_ctx_length=False,
+        # encoding_format — не поле OpenAIEmbeddings, поэтому через model_kwargs
         model_kwargs={"encoding_format": "float"},
     )
 
@@ -108,6 +115,7 @@ def _build_index() -> RagIndex:
         pickle.dumps(
             {
                 "mtime": KB_PATH.stat().st_mtime,
+                "model": EMBED_MODEL,
                 "chunks": chunks,
                 "vectors": vectors,
             }
@@ -122,7 +130,9 @@ def load_index() -> RagIndex:
         return _index
     if CACHE_PATH.exists() and KB_PATH.exists():
         data = pickle.loads(CACHE_PATH.read_bytes())
-        if data.get("mtime") == KB_PATH.stat().st_mtime:
+        same_kb = data.get("mtime") == KB_PATH.stat().st_mtime
+        same_model = data.get("model") == EMBED_MODEL
+        if same_kb and same_model:
             _index = RagIndex(data["chunks"], data["vectors"])
             return _index
     _index = _build_index()
@@ -137,6 +147,10 @@ def get_rag_context(query: str, k: int = TOP_K) -> str:
 
 
 if __name__ == "__main__":
+    # консоль Windows в cp1251 не печатает эмодзи из путеводителя
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    probe = _embeddings_client().embed_query("тест")
+    print(f"эмбеддинги: {EMBED_MODEL} @ {EMBED_BASE}, размерность {len(probe)}")
     index = load_index()
     print(f"чанков: {len(index.chunks)}")
     for i, chunk in enumerate(index.chunks, 1):
