@@ -1,5 +1,8 @@
 /myvenv
 /.env
+/.env.agent
+/.faiss_index_kb
 /__pycache__
 /.rag_index.pkl
 /_repo
+/.env.agent.example
