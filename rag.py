@@ -12,8 +12,8 @@ BASE_DIR = Path(__file__).resolve().parent
 KB_PATH = BASE_DIR / "knowledge_base.txt"
 CACHE_PATH = BASE_DIR / ".rag_index.pkl"
 
-OPENROUTER_BASE = "https://routerai.ru/api/v1"
-EMBED_MODEL = "baai/bge-m3"
+OPENROUTER_BASE = "http://127.0.0.1:1234/v1"
+EMBED_MODEL = "text-embedding-bge-m3"
 
 MAX_CHUNK_CHARS = 1200
 MIN_CHUNK_CHARS = 200
@@ -24,7 +24,7 @@ _index = None
 
 
 def _embeddings_client() -> OpenAIEmbeddings:
-    api_key = os.getenv("ROUTERAIRU_API_KEY")
+    api_key = "local"
     if not api_key:
         raise RuntimeError("Не задан ROUTERAIRU_API_KEY")
     return OpenAIEmbeddings(

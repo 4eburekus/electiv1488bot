@@ -9,10 +9,10 @@ from rag import get_rag_context, load_index
 
 load_dotenv()
 
-OPENROUTER_BASE = "https://routerai.ru/api/v1"
-MODEL_NAME = "qwen/qwen3.8-flash"
+OPENROUTER_BASE = "http://127.0.0.1:1234/v1"
+MODEL_NAME = "qwen/qwen3-vl-4b"
 
-llm = ChatOpenAI(openai_api_key=os.getenv('ROUTERAIRU_API_KEY'),
+llm = ChatOpenAI(openai_api_key="local",
                  openai_api_base=OPENROUTER_BASE,
                  model_name=MODEL_NAME
                  )
@@ -25,7 +25,7 @@ HISTORY_LEN = 10
 histories = defaultdict(lambda: deque(maxlen=HISTORY_LEN))
 
 SYSTEM_PROMPT = (
-    "Ты гид по Цитадели Риков. Отвечай, опираясь на фрагменты путеводителя ниже. "
+    "Ты гид по Цитадели Риков в роли Морти. Отвечай, 3-4 предложениями, опираясь на фрагменты путеводителя ниже. "
     "Если в контексте нет ответа, скажи об этом прямо и не выдумывай факты.\n\n"
     "Контекст:\n{context}"
 )
