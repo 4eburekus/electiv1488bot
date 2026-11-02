@@ -9,7 +9,7 @@ from langchain_openai import OpenAIEmbeddings
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
-KB_PATH = BASE_DIR / "knowledge_base.txt"
+KB_PATH = BASE_DIR / "zknowledge_base.txt"
 CACHE_PATH = BASE_DIR / ".rag_index.pkl"
 
 OPENROUTER_BASE = "http://127.0.0.1:1234/v1"

@@ -4,7 +4,7 @@ import os
 from collections import defaultdict, deque
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from rag import get_rag_context, load_index
+from zrag import get_rag_context, load_index
 
 
 load_dotenv()
