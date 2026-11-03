@@ -9,11 +9,12 @@ from zrag import get_rag_context, load_index
 
 load_dotenv()
 
-OPENROUTER_BASE = "http://127.0.0.1:1234/v1"
-MODEL_NAME = "qwen/qwen3-vl-4b"
+OPEN_API_KEY = os.getenv('LLM_OPEN_API_KEY')
+OPENAI_API_BASE = os.getenv('LLM_OPENAI_API_BASE')
+MODEL_NAME = os.getenv('LLM_MODEL_NAME')
 
-llm = ChatOpenAI(openai_api_key="local",
-                 openai_api_base=OPENROUTER_BASE,
+llm = ChatOpenAI(openai_api_key=OPEN_API_KEY,
+                 openai_api_base=OPENAI_API_BASE,
                  model_name=MODEL_NAME
                  )
 

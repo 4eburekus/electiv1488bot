@@ -2,5 +2,5 @@
 /.env
 /__pycache__
 /.rag_index.pkl
-/_repo
+/knowledge_sources
 /.env.agent.example

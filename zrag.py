@@ -8,12 +8,13 @@ from langchain_openai import OpenAIEmbeddings
 
 load_dotenv()
 
+EMB_LLM_OPEN_API_KEY = os.getenv('EMB_LLM_OPEN_API_KEY')
+EMB_LLM_OPENAI_API_BASE = os.getenv('EMB_LLM_OPENAI_API_BASE')
+EMB_LLM_MODEL_NAME = os.getenv('EMB_LLM_MODEL_NAME')
+
 BASE_DIR = Path(__file__).resolve().parent
 KB_PATH = BASE_DIR / "zknowledge_base.txt"
 CACHE_PATH = BASE_DIR / ".rag_index.pkl"
-
-OPENROUTER_BASE = "http://127.0.0.1:1234/v1"
-EMBED_MODEL = "text-embedding-bge-m3"
 
 MAX_CHUNK_CHARS = 1200
 MIN_CHUNK_CHARS = 200
@@ -24,13 +25,12 @@ _index = None
 
 
 def _embeddings_client() -> OpenAIEmbeddings:
-    api_key = "local"
-    if not api_key:
-        raise RuntimeError("Не задан ROUTERAIRU_API_KEY")
+    if not EMB_LLM_OPEN_API_KEY:
+        raise RuntimeError("Не задан EMB_LLM_OPEN_API_KEY")
     return OpenAIEmbeddings(
-        model=EMBED_MODEL,
-        openai_api_key=api_key,
-        openai_api_base=OPENROUTER_BASE,
+        model=EMB_LLM_MODEL_NAME,
+        openai_api_key=EMB_LLM_OPEN_API_KEY,
+        openai_api_base=EMB_LLM_OPENAI_API_BASE,
         check_embedding_ctx_length=False,
         model_kwargs={"encoding_format": "float"},
     )
