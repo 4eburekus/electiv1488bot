@@ -4,3 +4,5 @@
 /.rag_index.pkl
 /knowledge_sources
 /.env.agent.example
+/chroma_db
+/tool_rag/__pycache__
