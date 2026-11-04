@@ -6,3 +6,4 @@
 /.env.agent.example
 /chroma_db
 /tool_rag/__pycache__
+/tool_web_search/__pycache__
