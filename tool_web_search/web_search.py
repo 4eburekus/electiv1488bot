@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 
 DEFAULT_MAX_RESULTS = 5
-DEFAULT_TIMELIMIT = "d"  # d — сутки, w — неделя, m — месяц, y — год
+DEFAULT_TIMELIMIT = "y"  # проиндексировано за последнийy y — год
 DEFAULT_QUERY = "что нового в больших языковых моделях"
 
 MAX_RETRIES = 3  # всего попыток, включая первую
