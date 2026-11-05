@@ -33,6 +33,7 @@ from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain_core.retrievers import BaseRetriever
+from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -502,6 +503,112 @@ def build_kb_chain(
         document_variable_name="context",
     )
     return create_retrieval_chain(retriever=retriever, combine_docs_chain=kb_combine_chain)
+
+
+# --------------------------------------------------------------------------- #
+# Инструмент для агента: поиск по базе знаний как @tool
+# --------------------------------------------------------------------------- #
+
+# По умолчанию — ровно тот же прод, что в main(): обычный поиск + реранкер. Флаг в .env
+# нужен, чтобы в чате включить быстрый путь без cross-encoder, не трогая код.
+RAG_USE_RERANKER = os.getenv("RAG_USE_RERANKER", "1").strip().lower() in {"1", "true", "yes", "on"}
+RAG_TOOL_MAX_CHARS = int(os.getenv("RAG_TOOL_MAX_CHARS", "6000"))
+
+# Кэш дорогих ресурсов по образцу _RERANKER: хранилище и cross-encoder поднимаются один
+# раз на процесс, а не на каждый вопрос пользователя
+_VECTORSTORE = None
+_RETRIEVE: dict[tuple[bool, int], object] = {}
+
+
+def get_vectorstore():
+    """Лениво открывает Chroma. load_vectorstore() читает диск, поэтому не на уровне модуля."""
+    global _VECTORSTORE
+    if _VECTORSTORE is None:
+        _VECTORSTORE = load_vectorstore(verbose=False)
+    return _VECTORSTORE
+
+
+def get_retrieve(
+    use_reranker: bool | None = None,
+    k: int = RETRIEVE_K,
+    ):
+    """Возвращает retrieve(question) -> список чанков длиной k, кэширует на процесс.
+
+    use_reranker=None означает «как в настройках модуля», то есть как в main():
+    make_method(vectorstore, use_reranker=True). Единственное отличие: make_method
+    всегда отдаёт RETRIEVE_K чанков, а инструмент умеет отдать другое число, поэтому
+    для k != RETRIEVE_K цепочка повторяет те же две существующие функции
+    (base_candidates + rerank) с нашим k.
+    """
+    rr = RAG_USE_RERANKER if use_reranker is None else bool(use_reranker)
+    key = (rr, k)
+    if key not in _RETRIEVE:
+        vectorstore = get_vectorstore()
+        if k == RETRIEVE_K:
+            _RETRIEVE[key] = make_method(vectorstore, use_reranker=rr)
+        else:
+            # Та же логика, что в make_method: без реранкера просить у chromadb больше,
+            # чем отдадим, смысла нет
+            n_docs = CANDIDATES_K if rr else k
+
+            def retrieve(question: str) -> list[Document]:
+                docs = base_candidates(question, vectorstore, n_docs)
+                return rerank(question, docs, k) if rr else docs
+
+            _RETRIEVE[key] = retrieve
+    return _RETRIEVE[key]
+
+
+def format_docs(
+    docs: list[Document],
+    limit: int = RAG_TOOL_MAX_CHARS,
+    ) -> str:
+    """Чанки в текст для агента: «[N] файл.pdf стр.X» + содержимое, всего не больше limit.
+
+    PDF несёт переносы посреди строк и слов, поэтому содержимое сплющиваем в одну строку:
+    так в лимит символов влезает больше смысла, а разметка чанка не превращается в мусор.
+    """
+    parts, used = [], 0
+    for i, doc in enumerate(docs, 1):
+        meta = doc.metadata or {}
+        head = f"[{i}] {meta.get('source', 'источник неизвестен')} стр.{meta.get('page', '?')}"
+        body = " ".join(doc.page_content.split())
+        chunk = f"{head}\n{body}"
+        if used + len(chunk) > limit:
+            remain = limit - used
+            if remain < 300:  # обрезок в пару десятков символов агенту не помогает
+                break
+            parts.append(chunk[:remain].rstrip() + " …[обрезано]")
+            break
+        parts.append(chunk)
+        used += len(chunk) + 2
+    return "\n\n".join(parts)
+
+
+@tool
+def search_knowledge_base(query: str, k: int = RETRIEVE_K) -> str:
+    """Ищет по базе знаний: учебные PDF про ИИ-агентов, их концепции, паттерны и практики.
+
+    Аргументы:
+        query: тема или вопрос своими словами, одной фразой.
+        k: сколько фрагментов вернуть, от 1 до 20 (по умолчанию 5).
+
+    Возвращает нумерованные фрагменты с названием файла и страницей — ссылайся на них.
+    Если начинается с «⚠️», база недоступна: честно скажи об этом, не выдумывай ответ.
+    """
+    try:
+        n = max(1, min(int(k), CANDIDATES_K))
+        docs = get_retrieve(k=n)(query)
+    except FileNotFoundError as e:
+        # load_vectorstore() уже пишет, что индекс не построен и как его построить
+        return f"⚠️ {e}"
+    except Exception as e:  # noqa: BLE001 - наружу не бросаем: иначе развалится шаг агента
+        return f"⚠️ Поиск по базе знаний не удался: {type(e).__name__}: {e}"
+
+    if not docs:
+        return ("В базе знаний ничего не найдено по этому запросу. Не выдумывай ответ "
+                "по пустому контексту — скажи пользователю и предложи переформулировать.")
+    return format_docs(docs)
 
 
 # --------------------------------------------------------------------------- #

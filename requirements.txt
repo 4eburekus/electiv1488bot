@@ -31,6 +31,7 @@ psutil>=6.0
 
 
 dotenv
-telebot
+# telebot на PyPI — другой, давно не поддерживаемый пакет (в myvenv стоит pytelegrambotapi)
+pytelegrambotapi>=4.37,<5
 langchain_openai
 
