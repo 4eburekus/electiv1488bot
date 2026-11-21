@@ -1,3 +1,9 @@
 /myvenv
 /.env
 /__pycache__
+/.rag_index.pkl
+/knowledge_sources
+/.env.agent.example
+/chroma_db
+/check*.py
+/console_outputs
