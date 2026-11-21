@@ -7,3 +7,28 @@
 /chroma_db
 /check*.py
 /console_outputs
+
+# Секреты
+.env
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Окружения
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+
+# Эталонные решения лежат в ветке solutions, а не в main
+solutions/
