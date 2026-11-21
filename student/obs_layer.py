@@ -17,26 +17,63 @@
 
 Проверка: pytest tests/test_07_observability.py
 """
-import hashlib  # noqa: F401
-import os  # noqa: F401
+import hashlib
+import os
+
+# Длина хеша в записи: 12 шестнадцатеричных разрядов — 48 бит. Повтор запроса находится по
+# такому отпечатку однозначно, а восстановить по нему текст нельзя даже теоретически.
+HASH_PREFIX = 12
+
+# Хвост графика, который детектор помнит как «обычно». 10 минут достаточно, чтобы шум внутри
+# одной минуты (20 ± 6) не сошёл за всплеск, и мало, чтобы не протухнуть после смены режима.
+DEFAULT_WINDOW = 10
+# Порог «в 2.5 раза выше обычного». Фон даёт 14…26 при среднем ~20, всплеск ×4 — 56…104:
+# между ними остаётся зазор, в который порог попадает с запасом с обеих сторон.
+DEFAULT_FACTOR = 2.5
+# Пока истории меньше этого, сравнивать не с чем — тревоги не будет (иначе первая минута
+# графика с любым ненулевым трафиком выглядит атакой).
+MIN_HISTORY = 5
 
 
 def audit_event(user_id: str, event: str, text: str) -> dict:
-    # TODO: уберите text, добавьте chars и sha256.
-    return {"user_id": user_id, "event": event, "text": text}
+    body = text if isinstance(text, str) else str(text or "")
+    # Содержимое в журнал не попадает: он читается людьми и живёт дольше запроса. Остаётся
+    # метрика (chars) и отпечаток (sha256) — по нему видно, что тот же запрос приходил
+    # повторно, но что в нём было — не восстановить.
+    return {
+        "user_id": user_id,
+        "event": event,
+        "chars": len(body),
+        "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest()[:HASH_PREFIX],
+    }
 
 
 class AlertDetector:
-    def __init__(self, window: int = 10, factor: float = 2.5):
+    """Скользящее сравнение текущего трафика с «обычным» уровнем прошлых минут."""
+
+    def __init__(self, window: int = DEFAULT_WINDOW, factor: float = DEFAULT_FACTOR):
         self.window = window
         self.factor = factor
-        self.history = []
+        self.history = []   # только спокойные минуты: всплеск не должен учить детектор себе
 
     def observe(self, count: float) -> bool:
-        # TODO: сравните count с обычным уровнем.
+        value = float(count)
+        # Тревожная минута в базу не идёт. Иначе 16 минут подряд по 80 запросов подняли бы
+        # «обычный уровень» до 80, и детектор замолчал бы ровно посреди атаки.
+        if len(self.history) >= MIN_HISTORY:
+            usual = sum(self.history[-self.window:]) / len(self.history[-self.window:])
+            if value > self.factor * usual:
+                return True
+        self.history.append(value)
+        if self.window > 0 and len(self.history) > self.window:
+            # Храним не больше window минут: старое «обычное» со временем протухает.
+            del self.history[:-self.window]
         return False
 
 
 def kill_switch_active(path: str) -> bool:
-    # TODO: проверьте существование файла.
-    return False
+    # Решение принимает файловая система, а не модель: агент не может «передумать» и обойти
+    # проверку, потому что её в его тексте нет.
+    if not path:
+        return False
+    return os.path.exists(str(path))
