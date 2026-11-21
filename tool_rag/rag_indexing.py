@@ -20,6 +20,7 @@ PDF считается штраф за искажения и берётся то
 """
 import hashlib
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -30,7 +31,16 @@ from langchain_community.document_loaders import PDFPlumberLoader, PyPDFLoader
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from rag import EMB_LLM_MODEL_NAME, embeddings_rag_indexing
+# Этот скрипт запускается из tool_rag/ и импортирует соседние модули как top-уровневые
+# (`from rag import ...`), поэтому корень проекта добавляем в sys.path сами: без него
+# `import security` отсюда не найдётся. PROJECT_ROOT ниже по файлу — то же значение.
+_ROOT = str(Path(__file__).resolve().parent.parent)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from security import clean_document, is_trusted_source  # noqa: E402
+
+from rag import EMB_LLM_MODEL_NAME, embeddings_rag_indexing  # noqa: E402
 
 # Всё привязано к файлу, а не к текущей директории запуска: скрипт можно запускать откуда угодно
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -57,7 +67,13 @@ def normalize_text(text: str) -> str:
     \xa0 (неразрывный пробел) и \u2028/\u2029 (LINE SEPARATOR) — артефакты вёрстки:
     для эмбеддинга это почти не мешает, но они не совпадают с обычным пробелом при
     поиске подстрокой и раздувают чанки пустыми строками.
+
+    Первым шагом стоит clean_document из слоя базы знаний: он вырезает HTML-комментарии,
+    элементы со скрытым стилем (display:none, белый по белому) и символы нулевой ширины.
+    Так отравленный PDF не доезжает до индекса, а не только до ответа: фильтр на выдаче
+    ловит только то, что уже легло в базу.
     """
+    text = clean_document(text)
     text = text.replace("\u2028", "\n").replace("\u2029", "\n")
     text = text.replace("\xa0", " ").replace("\t", "    ")
     lines = [line.rstrip() for line in text.split("\n")]
@@ -178,8 +194,14 @@ def split_documents(all_docs: list[Document]) -> list[Document]:
     # Добавление/удаление PDF не сдвигает идентификаторы остальных чанков,
     # и повторная индексация не создаёт дублей.
     unique: dict[str, Document] = {}
+    rejected: set[str] = set()
     for chunk in chunks:
         source = Path(str(chunk.metadata.get("source", ""))).name
+        # Слой базы знаний: в индекс попадают только файлы нашей папки. Проверка на
+        # приёме, а не на выдаче, — иначе отравленная запись живёт в Chroma между прогонами.
+        if not is_trusted_source(source):
+            rejected.add(str(chunk.metadata.get("source", ""))[:80])
+            continue
         page = int(chunk.metadata.get("page", 0)) + 1  # для человека страницы нумеруются с 1
         digest = hashlib.sha1(f"{source}\n{page}\n{chunk.page_content}".encode("utf-8")).hexdigest()[:16]
         if digest in unique:
@@ -188,6 +210,15 @@ def split_documents(all_docs: list[Document]) -> list[Document]:
         # метаданных (Producer/ModDate/page_label...), в базе они лишь раздувают запись.
         chunk.metadata = {"source": source, "page": page, "id": digest}
         unique[digest] = chunk
+
+    if rejected:
+        print(f"🚫 Отклонено чанков с недоверенным источником: {len(rejected)} вид(а): "
+              f"{', '.join(sorted(rejected)[:5])}")
+    if not unique:
+        raise RuntimeError(
+            "Ни один чанк не прошёл проверку источника — проверь, что в knowledge_sources/ "
+            "лежат именно PDF и их имена не содержат путей"
+        )
 
     if len(unique) != len(chunks):
         print(f"♻️  Убрано дубликатов чанков: {len(chunks) - len(unique)}")

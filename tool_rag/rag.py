@@ -39,6 +39,23 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
+# Слои защиты. Импорт строго после load_dotenv(): секреты регистрируются в маскирователе
+# при импорте пакета, а до него значений из .env ещё нет. Путь в sys.path нужен для
+# rag_indexing.py: он подключает этот файл как top-модуль (`from rag import ...`), когда
+# его запускают из tool_rag/, и без корня проекта `import security` там не найдётся.
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from security import (  # noqa: E402
+    DENY,
+    decide,
+    error_summary,
+    is_trusted_source,
+    log_event,
+    runtime,
+    wrap_untrusted,
+)
+
 EMB_LLM_OPEN_API_KEY = os.getenv('EMB_LLM_OPEN_API_KEY')
 EMB_LLM_OPENAI_API_BASE = os.getenv('EMB_LLM_OPENAI_API_BASE')
 EMB_LLM_MODEL_NAME = os.getenv('EMB_LLM_MODEL_NAME')
@@ -567,18 +584,47 @@ def format_docs(
 
     PDF несёт переносы посреди строк и слов, поэтому содержимое сплющиваем в одну строку:
     так в лимит символов влезает больше смысла, а разметка чанка не превращается в мусор.
+
+    Здесь работают два слоя защиты:
+      - is_trusted_source: в метаданных должно быть имя нашего PDF, а не путь, URL или
+        «web» — то есть чанк, который в индекс подмешали из другого места, в выдачу не пойдёт;
+      - wrap_untrusted: содержимое учебника — это данные. Без тега модель не отличает
+        фразу внутри PDF от указания пользователя.
+
+    Лимит считается по уже обёрнутому тексту, иначе сумма обёрток незаметно превысила бы
+    бюджет, который проверяет check_agent_offline.py.
     """
+    TRUNCATED = " …[обрезано]"
     parts, used = [], 0
     for i, doc in enumerate(docs, 1):
         meta = doc.metadata or {}
-        head = f"[{i}] {meta.get('source', 'источник неизвестен')} стр.{meta.get('page', '?')}"
+        source = str(meta.get("source", "") or "")
+        if not is_trusted_source(source):
+            # Молча выбрасываем и пишем в журнал: источник в метаданных — единственный
+            # признак, по которому человек поймёт, что индекс отравлен.
+            log_event("rag", "untrusted_source", source)
+            continue
+        page = meta.get("page", "?")
         body = " ".join(doc.page_content.split())
-        chunk = f"{head}\n{body}"
+        # Формат подписи («[N] файл.pdf стр.X») сохранён: на него ссылает промпт.
+        head = f"[{i}] {source} стр.{page}\n"
+
+        def wrap(text: str) -> str:
+            return wrap_untrusted(head + text, source=source, ref=f"стр.{page}")
+
+        chunk = wrap(body)
         if used + len(chunk) > limit:
             remain = limit - used
             if remain < 300:  # обрезок в пару десятков символов агенту не помогает
                 break
-            parts.append(chunk[:remain].rstrip() + " …[обрезано]")
+            # Резать нужно тело, а не обёртку: у обрезанного </document> модель читает
+            # остаток как команды, и весь смысл тега пропадает. Наценка считается по
+            # фактической длине обёртки и включает метку обрезки, чтобы сумма гарантированно
+            # не вышла за limit — это проверяет check_agent_offline.py.
+            cut = remain - (len(chunk) - len(body)) - len(TRUNCATED)
+            if cut < 200:
+                break
+            parts.append(wrap(body[:cut].rstrip() + TRUNCATED))
             break
         parts.append(chunk)
         used += len(chunk) + 2
@@ -596,19 +642,42 @@ def search_knowledge_base(query: str, k: int = RETRIEVE_K) -> str:
     Возвращает нумерованные фрагменты с названием файла и страницей — ссылайся на них.
     Если начинается с «⚠️», база недоступна: честно скажи об этом, не выдумывай ответ.
     """
+    # Шлюз. Точка «перед вызовом инструмента» в create_agent доступна только отсюда, из
+    # тела: цикл «модель → tool_calls» спрятан внутри графа. Решение принимает код, и
+    # отклонённый запрос не доходит ни до Chroma, ни до эмбеддингов.
+    if decide("search_knowledge_base", {"query": query}) == DENY:
+        log_event("gateway", "denied", "search_knowledge_base")
+        return ("⚠️ Запрос к базе знаний отклонён шлюзом: он слишком длинный, чтобы быть "
+                "вопросом. Сформулируй короче и скажи пользователю об этом.")
+
+    # Бюджет шагов на один вопрос. Раньше его не было, и зациклившаяся модель упиралась в
+    # recursion_limit — пользователь получал голый GraphRecursionError вместо объяснения.
+    if not runtime.spend_step():
+        log_event("gateway", "budget_exhausted", "search_knowledge_base")
+        return ("⚠️ Достигнут лимит шагов на один вопрос. Больше инструментов не зови — "
+                "собери ответ из того, что уже найдено.")
+
     try:
         n = max(1, min(int(k), CANDIDATES_K))
         docs = get_retrieve(k=n)(query)
     except FileNotFoundError as e:
         # load_vectorstore() уже пишет, что индекс не построен и как его построить
-        return f"⚠️ {e}"
+        return f"⚠️ {error_summary(e)}"
     except Exception as e:  # noqa: BLE001 - наружу не бросаем: иначе развалится шаг агента
-        return f"⚠️ Поиск по базе знаний не удался: {type(e).__name__}: {e}"
+        log_event("rag", "search_error", f"{type(e).__name__}: {e}")
+        return f"⚠️ Поиск по базе знаний не удался: {error_summary(e)}"
 
     if not docs:
+        # Без обёртки: это ответ самого бота, а не чужой текст, и размечать его не нужно.
         return ("В базе знаний ничего не найдено по этому запросу. Не выдумывай ответ "
                 "по пустому контексту — скажи пользователю и предложи переформулировать.")
-    return format_docs(docs)
+    formatted = format_docs(docs)
+    if not formatted:
+        # Чанки были, но все с недоверенным источником: это не «ничего не найдено»,
+        # а признак отравленного или чужого индекса — молча возвращать пустоту нельзя.
+        return ("⚠️ Найденные фрагменты отклонены слоем базы знаний: у них недоверенный "
+                "источник в метаданных. Нужна переиндексация knowledge_sources/.")
+    return formatted
 
 
 # --------------------------------------------------------------------------- #

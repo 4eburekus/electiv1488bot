@@ -15,6 +15,21 @@ from tool_rag import rag
 from tool_rag.rag import get_retrieve, search_knowledge_base
 from tool_web_search.web_search import search_web
 
+# Слои защиты. Импорт строго после load_dotenv(): часть флагов читается на уровне модуля.
+from security import (
+    InputRejected,
+    RateLimiter,
+    build_system_prompt,
+    check_output,
+    error_summary,
+    kill_switch_active,
+    log_event,
+    redact,
+    runtime,
+    sanitize_input,
+    TrafficMonitor,
+)
+
 OPEN_API_KEY = os.getenv('LLM_OPEN_API_KEY')
 OPENAI_API_BASE = os.getenv('LLM_OPENAI_API_BASE')
 MODEL_NAME = os.getenv('LLM_MODEL_NAME')
@@ -38,7 +53,9 @@ llm = ChatOpenAI(
 
 # ------------Промт для продакшена------------
 # Имена инструментов те, что реально подключены ниже в TOOLS
-SYSTEM_PROMPT = ("""Ты эксперт-консультант по теме ИИ-агентов.
+# База промпта не меняется: SECURITY_RULES дописывает security/prompt_layer.py, чтобы
+# правила и текст стратегии искали и правились в одном месте.
+SYSTEM_PROMPT_BASE = ("""Ты эксперт-консультант по теме ИИ-агентов.
 Твоя задача: давать точные ответы о концепциях, паттернах
 и практиках построения ИИ-агентов.
 
@@ -51,6 +68,8 @@ SYSTEM_PROMPT = ("""Ты эксперт-консультант по теме И�
 
 Отвечай структурированно: ключевые тезисы, затем детали.
 Ссылайся на источники: файл и страницу из базы знаний, ссылку из веб-поиска.""")
+
+SYSTEM_PROMPT = build_system_prompt(SYSTEM_PROMPT_BASE)
 
 TOOLS = [search_knowledge_base, search_web]
 
@@ -68,35 +87,37 @@ def ask_agent(question: str) -> str:
     if agent is None:
         return "Агент не инициализирован."
 
-    print(f"❓ Вопрос: {question}")
-    print("=" * 70)
+    # Состояние запроса (бюджет шагов шлюза и хосты из выдачи) открывает handle_message:
+    # здесь оно только читается. Если ask_agent вызывают напрямую (офлайн-проверки),
+    # состояния нет — слои тогда не мешают, а не падают.
+    log_event("user", "question", question)
 
     # Запрос без сохранения глобальной истории
     try:
         result = agent.invoke(
             {"messages": [HumanMessage(content=question)]},
-            config={"recursion_limit": 12}
+            # лимит шагов графа держим больше бюджета шлюза, чтобы раньше сработал шлюз
+            # и объяснил причину, а не голый GraphRecursionError
+            config={"recursion_limit": runtime.recursion_limit()}
         )
     except Exception as e:
-        # Без этого исключения Telegram-слой показал бы «бот молчит»
-        print(f"❌ Агент не ответил: {type(e).__name__}: {e}")
-        return f"⚠️ Не получилось получить ответ: {type(e).__name__}: {e}"
+        # Без этого исключения Telegram-слой показал бы «бот молчит». Сам текст ошибки
+        # знает URL, пути и ключи — наружу идёт только маскированная сводка.
+        log_event("user", "agent_error", f"{type(e).__name__}: {e}")
+        return f"⚠️ Не получилось получить ответ: {error_summary(e)}"
 
     messages = result.get("messages", [])
 
-    # Лог вызовов инструментов в консоли
+    # Шаги прохода пишутся в журнал (без содержимого запросов), а не в консоль
     for msg in messages:
         msg_type = type(msg).__name__
         if msg_type == "AIMessage" and hasattr(msg, "tool_calls") and msg.tool_calls:
             for tc in msg.tool_calls:
-                print(f"  🔧 Вызов инструмента: {tc['name']}")
-                print(f"     Запрос: {tc['args'].get('question', tc['args'].get('query', ''))}")
+                log_event("trace", "tool_call", tc["name"])
         elif msg_type == "ToolMessage":
-            content_preview = str(msg.content).replace("\n", " ")
-            print(f"  📦 Результат: {content_preview[:100]}...")
+            log_event("trace", "tool_result", str(msg.content)[:100])
 
     final_answer = str(getattr(messages[-1], "content", "")) if messages else "Нет ответа"
-    print(f"\n💬 Ответ агента:\n{final_answer}\n")
     return final_answer or "Агент вернул пустой ответ — попробуй переформулировать вопрос."
 
 
@@ -207,14 +228,64 @@ def handle_non_text(message):
     )
 
 
+# Один лимитер на процесс: ключ — chat_id, окно скользящее (security/input_layer.py).
+RATE_LIMITER = RateLimiter()
+# Тревога о всплеске трафика: считает сообщения по минутам и сравнивает с обычным
+# уровнем. Ничего не блокирует (для этого есть RATE_LIMITER) — только запись в журнал.
+TRAFFIC = TrafficMonitor()
+
+
+def guard_input(chat_id: str, question: str) -> tuple[str | None, str | None]:
+    """Проверяет сообщение ДО обращения к модели.
+
+    Возвращает пару (нормализованный_запрос, текст_отказа): ровно один из элементов
+    непустой. Порядок слоёв как в лабораторной — выключатель, частота, содержимое.
+    Решение принимает код, а не модель, поэтому отклонённый запрос до неё не доходит.
+    """
+    if kill_switch_active():
+        log_event(chat_id, "kill_switch", question)
+        return None, "🛑 Бот временно остановлен администратором. Попробуйте позже."
+    if not RATE_LIMITER.allow(chat_id, time.time()):
+        log_event(chat_id, "rate_limited", question)
+        return None, (f"⏳ Слишком много запросов: больше {RATE_LIMITER.limit} за "
+                      f"{int(RATE_LIMITER.window_s)} секунд. Подождите немного.")
+    try:
+        return sanitize_input(question), None
+    except InputRejected as e:
+        # Причина говорит про форму запроса (длина, пустота), а не про его содержимое,
+        # поэтому показать её безопасно; логируем без текста.
+        log_event(chat_id, "input_rejected", str(e))
+        return None, (f"📝 Такой запрос не приму: {e}. "
+                      "Напиши короче и обычными символами.")
+
+
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     """Принимает сообщение от пользователя, вызывает агента и отправляет ответ."""
+    chat_id = str(message.chat.id)
+    # Состояние одного запроса: бюджет шагов шлюза и хосты, реально вернувшиеся выдачей
+    # инструментов. Открыть нужно здесь, а не внутри ask_agent: check_output вызывается
+    # после ask_agent и читает current_hosts() — если к тому моменту состояние уже
+    # закрыто, список пустой, и срезались бы все легальные ссылки.
+    _, token = runtime.begin_request()
     try:
         question = (message.text or "").strip()
         if not question:
             bot.reply_to(message, "Я понимаю только текст 📝 Напиши вопрос словами.")
             return
+
+        # Дальше работает только нормализованная форма: без невидимых символов и в лимите
+        # длины. Отказ возвращается вторым элементом пары, и тогда первый пустой.
+        question, refusal = guard_input(chat_id, question)
+        if refusal:
+            bot.reply_to(message, refusal)
+            return
+
+        # Запрос прошёл все входные проверки — учитываем его в минутном трафике.
+        # Тревога не меняет ответ пользователю: она нужна, чтобы всплеск (ботнет,
+        # дублирование запросов) было видно в журнале.
+        if TRAFFIC.observe():
+            log_event(chat_id, "traffic_spike", f"{TRAFFIC.count} запросов за минуту")
 
         # Показываем статус "печатает...", пока агент думает
         bot.send_chat_action(message.chat.id, 'typing')
@@ -222,11 +293,19 @@ def handle_message(message):
         # Получаем ответ от изолированной функции агента
         answer = ask_agent(question)
 
+        # Ответ модели — тоже недоверенный текст: сначала срезаем ссылки, которых бот
+        # сам не вернул в выдаче (runtime.current_hosts), потом маскируем секреты.
+        answer = redact(check_output(answer, runtime.current_hosts()))
+
         # Отправляем ответ пользователю через отдельную функцию
         send_bot_reply(message.chat.id, answer, reply_to_message_id=message.message_id)
+        log_event(chat_id, "reply", answer)
 
     except Exception as e:
-        bot.reply_to(message, f"⚠️ Произошла ошибка: {str(e)}")
+        log_event(chat_id, "handler_error", f"{type(e).__name__}: {e}")
+        bot.reply_to(message, f"⚠️ Произошла ошибка: {error_summary(e)}")
+    finally:
+        runtime.end_request(token)
 
 
 def warmup() -> None:
@@ -249,7 +328,7 @@ def warmup() -> None:
               f"(реранкер: {'вкл' if rag.RAG_USE_RERANKER else 'выкл'})")
     except Exception as e:
         print(f"⚠️ Прогрев не прошёл — поиск по базе знаний будет недоступен: "
-              f"{type(e).__name__}: {e}")
+              f"{error_summary(e)}")
 
 
 if __name__ == "__main__":

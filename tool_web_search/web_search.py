@@ -1,9 +1,26 @@
 import os
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 from langchain_core.tools import tool
+
+# Слои защиты. Корень проекта в sys.path — для случая, когда модуль импортируют не из
+# корня (запуск этого файла как скрипта, прогоны из tool_web_search/).
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from security import (  # noqa: E402
+    DENY,
+    decide,
+    error_summary,
+    log_event,
+    runtime,
+    wrap_untrusted,
+)
 
 DEFAULT_MAX_RESULTS = 5
 DEFAULT_TIMELIMIT = "y"  # проиндексировано за последнийy y — год
@@ -42,13 +59,15 @@ def web_search(
             return future.result(timeout=SEARCH_TIMEOUT)
         except Exception as exc:  # noqa: BLE001 - любую ошибку перехватываем и повторяем
             last_error = exc
-            print(f"⚠️  Попытка {attempt}/{MAX_RETRIES} не удалась: {type(exc).__name__}: {exc}")
+            # Текст ошибки requests/urllib3 содержит URL запроса и заголовки, в том числе
+            # Authorization — в консоль он попадает уже замаскированным.
+            print(f"⚠️  Попытка {attempt}/{MAX_RETRIES} не удалась: {error_summary(exc)}")
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY)
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
-    print(f"❌ Поиск не выполнен после {MAX_RETRIES} попыток: {type(last_error).__name__}: {last_error}")
+    print(f"❌ Поиск не выполнен после {MAX_RETRIES} попыток: {error_summary(last_error)}")
     return []
 
 
@@ -76,6 +95,19 @@ def search_web(
     Возвращает нумерованный список: заголовок, ссылка, фрагмент текста — ссылайся на
     ссылки. Если ответ начинается с «⚠️», поиск недоступен: так и скажи пользователю.
     """
+    # Шлюз. «http» внутри запроса — это не вопрос, а готовый адрес: так модель утаскивают
+    # на страницу с инструкцией. Точка решения — тело инструмента, потому что цикл агента
+    # спрятан внутри create_agent.
+    if decide("search_web", {"query": query}) == DENY:
+        log_event("gateway", "denied", "search_web")
+        return ("⚠️ Веб-запрос отклонён шлюзом: в поисковом запросе не должно быть ссылок, "
+                "и он не должен быть таким длинным. Сформулируй тему словами и повтори, "
+                "или опирайся на базу знаний.")
+    if not runtime.spend_step():
+        log_event("gateway", "budget_exhausted", "search_web")
+        return ("⚠️ Достигнут лимит шагов на один вопрос. Больше инструментов не зови — "
+                "собери ответ из того, что уже найдено.")
+
     n = max(1, min(int(max_results), WEB_TOOL_MAX_RESULTS))
     tl = (timelimit or DEFAULT_TIMELIMIT).strip().lower()[:1]
     if tl not in {"d", "w", "m", "y"}:
@@ -84,7 +116,8 @@ def search_web(
     try:
         results = web_search(query, max_results=n, timelimit=tl)
     except Exception as exc:  # noqa: BLE001 - наружу не бросаем: иначе развалится шаг агента
-        return (f"⚠️ Веб-поиск завершился ошибкой: {type(exc).__name__}: {exc}. "
+        log_event("web", "search_error", f"{type(exc).__name__}: {exc}")
+        return (f"⚠️ Веб-поиск завершился ошибкой: {error_summary(exc)}. "
                 "Скажи пользователю честно и, если можно, опирайся на базу знаний.")
 
     if not results:
@@ -96,7 +129,14 @@ def search_web(
         title = (item.get("title") or "без заголовка").strip()
         link = (item.get("link") or "").strip()
         snippet = " ".join(str(item.get("snippet") or "").split())[:WEB_TOOL_MAX_SNIPPET]
-        block = f"{i}. {title}\n   {link}\n   {snippet}"
+        # Заголовок и сниппет чужой страницы — недоверенные данные: их заворачиваем в тег.
+        # Ссылку оставляем снаружи обёртки: это поле выдачи, по нему бот сверяет
+        # разрешённые хосты, и прятать его внутрь «данных» нельзя.
+        block = wrap_untrusted(f"{i}. {title}\n{snippet}", source="web", ref=link)
+        block = f"{block}   ссылка: {link}"
+        # Хост разрешаем только за тот адрес, который реально вернул поиск, — список,
+        # который потом проверяет output_layer.check_output.
+        runtime.allow_host(link)
         if used + len(block) > WEB_TOOL_MAX_CHARS:
             break
         parts.append(block)
